@@ -1,11 +1,13 @@
-"""Web search with Tavily, plus basic cleaning. Results are cached for 24 hours."""
+"""Web search with Tavily: runs all planned searches in parallel, cleans the text,
+removes duplicates, and remembers which topics each page was found for."""
 import re
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 from tavily import TavilyClient
 
-MAX_CHARS_PER_PAGE = 8000  # keeps embedding fast on free hosting
+RESULTS_PER_QUERY = 4
+MAX_CHARS_PER_PAGE = 6000  # keeps embedding fast on free hosting
 EXCLUDED_DOMAINS = ["scribd.com", "slideshare.net", "pdfcoffee.com", "studocu.com"]
 LONG_TOKEN = re.compile(r"\S{40,}")  # encoded data, long URLs, junk strings
 
@@ -26,31 +28,35 @@ def looks_like_real_text(text: str) -> bool:
     return alphabetic / len(words) > 0.6
 
 
+def _search_one(client, query: str) -> list:
+    try:
+        response = client.search(
+            query,
+            max_results=RESULTS_PER_QUERY,
+            include_raw_content=True,
+            exclude_domains=EXCLUDED_DOMAINS,
+        ) or {}
+        return response.get("results") or []
+    except Exception:
+        return []  # one failed search shouldn't break the whole report
+
+
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def search_company(company: str, location: str) -> list:
+def run_searches(plan: list) -> list:
+    """plan: [{"topic", "query"}, ...] -> pages: [{"url", "title", "text", "topics"}, ...]"""
     client = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
-    year = date.today().year
-    queries = [
-        f"{company} company overview business model",
-        f"{company} latest news {year}",
-        f"{company} work culture employees {location}",
-    ]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        all_results = list(pool.map(lambda p: _search_one(client, p["query"]), plan))
 
-    pages, seen_urls = [], set()
-    for query in queries:
-        try:
-            response = client.search(
-                query,
-                max_results=5,
-                include_raw_content=True,
-                exclude_domains=EXCLUDED_DOMAINS,
-            ) or {}
-        except Exception:
-            continue  # one failed search shouldn't break the whole report
-
-        for r in response.get("results") or []:
+    pages_by_url = {}
+    for item, results in zip(plan, all_results):
+        for r in results:
             url = r.get("url")
-            if not url or url in seen_urls:
+            if not url:
+                continue
+            if url in pages_by_url:  # same page found by another search
+                if item["topic"] not in pages_by_url[url]["topics"]:
+                    pages_by_url[url]["topics"].append(item["topic"])
                 continue
             text = clean_text(r.get("raw_content"))
             if not looks_like_real_text(text):
@@ -58,10 +64,10 @@ def search_company(company: str, location: str) -> list:
                 text = clean_text(r.get("content"))
                 if len(text.split()) < 30:
                     continue
-            seen_urls.add(url)
-            pages.append({
+            pages_by_url[url] = {
                 "url": url,
                 "title": r.get("title") or url,
                 "text": text[:MAX_CHARS_PER_PAGE],
-            })
-    return pages
+                "topics": [item["topic"]],
+            }
+    return list(pages_by_url.values())
