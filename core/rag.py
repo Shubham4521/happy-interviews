@@ -39,4 +39,4 @@ def retrieve(pages: list[dict], query: str, top_k: int = 6,
         for p in pages
     ]
     splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
-    index = VectorStoreIndex.from_documents(
+    index = VectorStoreIndex.from_documents(documents, transformations=[splitter], embed_model=get_embed_model())
