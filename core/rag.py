@@ -1,34 +1,5 @@
-"""Chunking, embedding and retrieval with LlamaIndex + FastEmbed."""
-import os
-
-import nltk
-
-# --- NLTK setup: use a private folder that only this app can write to ---
-NLTK_DIR = os.path.join(os.path.expanduser("~"), ".happy_nltk_data")
-os.makedirs(NLTK_DIR, mode=0o700, exist_ok=True)
-os.environ["NLTK_DATA"] = NLTK_DIR          # LlamaIndex reads this
-nltk.data.path.insert(0, NLTK_DIR)          # NLTK checks this folder first
-for package, resource in [("stopwords", "corpora/stopwords"),
-                          ("punkt_tab", "tokenizers/punkt_tab")]:
-    try:
-        nltk.data.find(resource)
-    except LookupError:
-        nltk.download(package, download_dir=NLTK_DIR, quiet=True)
-# -------------------------------------------------------------------------
-
-import streamlit as st  # noqa: E402
-from llama_index.core import Document, VectorStoreIndex  # noqa: E402
-from llama_index.core.node_parser import SentenceSplitter  # noqa: E402
-from llama_index.embeddings.fastembed import FastEmbedEmbedding  # noqa: E402
-
-
-@st.cache_resource(show_spinner=False)
-def get_embed_model():
-    # Small, free embedding model that runs inside the app (no API needed)
-    return FastEmbedEmbedding(model_name="BAAI/bge-small-en-v1.5")
-
-
-def retrieve(pages: list[dict], query: str, top_k: int = 6) -> list[dict]:
+def retrieve(pages: list[dict], query: str, top_k: int = 6,
+             max_per_source: int = 2) -> list[dict]:
     documents = [
         Document(
             text=p["text"],
@@ -41,13 +12,21 @@ def retrieve(pages: list[dict], query: str, top_k: int = 6) -> list[dict]:
     index = VectorStoreIndex.from_documents(
         documents, transformations=[splitter], embed_model=get_embed_model()
     )
-    results = index.as_retriever(similarity_top_k=top_k).retrieve(query)
-    return [
-        {
+    # Fetch extra candidates, then cap chunks per page so one page can't dominate
+    candidates = index.as_retriever(similarity_top_k=top_k * 4).retrieve(query)
+
+    picked, count_per_url = [], {}
+    for r in candidates:
+        url = r.metadata["url"]
+        if count_per_url.get(url, 0) >= max_per_source:
+            continue
+        count_per_url[url] = count_per_url.get(url, 0) + 1
+        picked.append({
             "text": r.get_content(),
-            "url": r.metadata["url"],
+            "url": url,
             "title": r.metadata["title"],
             "score": round(r.score or 0, 3),
-        }
-        for r in results
-    ]
+        })
+        if len(picked) == top_k:
+            break
+    return picked
