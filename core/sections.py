@@ -15,16 +15,17 @@ TOPICS = {
 }
 
 # Backup search templates, used if the AI planner fails or misses a topic
+# {level} and {round} may be empty; extra spaces are cleaned up by the planner.
 FALLBACK_QUERIES = {
     "company": ["{company} company overview business model"],
     "news": ["{company} latest news {year}"],
     "process": [
-        "{company} {role} interview process rounds",
+        "{company} {level} {role} interview process rounds",
         "{company} {role} interview experience {location}",
     ],
     "questions": [
-        "{company} {role} interview questions",
-        "{company} {role} technical interview questions asked",
+        "{company} {level} {role} interview questions",
+        "{company} {role} {round} interview questions asked",
     ],
     "culture": ["{company} work culture employee reviews {location}"],
     "role_skills": ["{company} {role} job description skills requirements"],

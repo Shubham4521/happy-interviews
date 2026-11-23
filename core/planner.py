@@ -1,7 +1,8 @@
 """Query planner: the AI writes targeted searches, each tagged with a topic.
 
-If the AI's answer is missing, malformed, or skips a topic, we fill the gaps
-from fixed templates, so the app always gets exactly the searches it needs.
+It now also uses the candidate's level, interview round and the gist of the JD
+(never the resume) to make searches more specific. If the AI's answer is
+missing, malformed, or skips a topic, gaps are filled from fixed templates.
 """
 import json
 import re
@@ -17,9 +18,14 @@ Return ONLY valid JSON, no explanation, in this exact shape:
 {"queries": [{"topic": "<topic>", "query": "<search text>"}]}"""
 
 
-def _fallback(topic: str, company: str, role: str, location: str) -> list:
+def _tidy(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _fallback(topic, company, role, location, level_words, round_words) -> list:
     year = date.today().year
-    return [t.format(company=company, role=role, location=location, year=year)
+    return [_tidy(t.format(company=company, role=role, location=location, year=year,
+                           level=level_words, round=round_words or "technical"))
             for t in FALLBACK_QUERIES[topic]]
 
 
@@ -35,12 +41,24 @@ def _parse_json(text: str):
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def plan_queries(company: str, role: str, location: str, level: str = "",
-                 provider: str = "auto") -> list:
+def plan_queries(company: str, role: str, location: str, level_words: str = "",
+                 provider: str = "auto", round_type: str = "All rounds",
+                 jd_gist: str = "") -> list:
     """Returns [{"topic": ..., "query": ..., "source": "ai" | "template"}, ...]."""
     year = date.today().year
+    round_words = "" if round_type == "All rounds" else round_type.lower()
     needs = ", ".join(f'{count} for "{topic}"' for topic, count in TOPICS.items())
-    user = f"""Candidate: {level + ' ' if level else ''}{role} at {company}, {location}. Current year: {year}.
+    extras = []
+    if level_words:
+        extras.append(f"Candidate level: {level_words}. Use it in process and questions searches.")
+    if round_words:
+        extras.append(f"Focus the questions searches on the {round_words} round.")
+    if jd_gist:
+        extras.append(f"Key parts of the job description (use 1-2 key skills in role_skills "
+                      f"and questions searches): {jd_gist}")
+
+    user = f"""Candidate: {role} at {company}, {location}. Current year: {year}.
+{chr(10).join(extras)}
 
 Write {sum(TOPICS.values())} web search queries: {needs}.
 Topic meanings:
@@ -60,7 +78,7 @@ Rules: every query must include "{company}"; keep each under 12 words; make them
             if not isinstance(item, dict):
                 continue
             topic = str(item.get("topic", "")).strip().lower()
-            query = " ".join(str(item.get("query", "")).split())
+            query = _tidy(str(item.get("query", "")))
             if topic not in TOPICS or not query or len(query) > 150:
                 continue
             if company.lower() not in query.lower():
@@ -74,7 +92,7 @@ Rules: every query must include "{company}"; keep each under 12 words; make them
     plan = []
     for topic, count in TOPICS.items():
         chosen = [(q, "ai") for q in ai_queries.get(topic, [])[:count]]
-        for q in _fallback(topic, company, role, location):
+        for q in _fallback(topic, company, role, location, level_words, round_words):
             if len(chosen) >= count:
                 break
             if q not in [c[0] for c in chosen]:
