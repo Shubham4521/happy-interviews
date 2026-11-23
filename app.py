@@ -179,6 +179,7 @@ def show_debug(report: dict):
             note = (" (fallback)" if r["fallback"] else "") + (" (retried)" if r.get("retried") else "")
             weak = " | weak sources" if r["weak"] else ""
             fake = f" | removed fake citations {r['removed_citations']}" if r["removed_citations"] else ""
+            fake += f" | {r['downgraded']} uncited Source point(s) shown as AI tip" if r.get("downgraded") else ""
             st.markdown(f"- **{r['title']}**: {r['model']}{note} | {r['seconds']}s{weak}{fake}")
             for err in r.get("provider_errors") or []:
                 st.caption(f"↳ {err}")
