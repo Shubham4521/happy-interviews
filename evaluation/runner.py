@@ -36,6 +36,7 @@ def run_case(case: dict, provider: str = "auto") -> dict:
             "key": k, "provider": r.get("provider"), "fallback": r.get("fallback", False),
             "retried": r.get("retried", False), "failed": bool(r.get("error")), "weak": r.get("weak", False),
             "removed_citations": len(r.get("removed_citations") or []),
+            "downgraded": r.get("downgraded", 0), "model": r.get("model"),
         } for k, r in results.items()]
 
         # Grounding mix: how many points of each kind
@@ -55,7 +56,7 @@ def run_case(case: dict, provider: str = "auto") -> dict:
                               "nums": c["nums"], "evidence": evidence_for(c["nums"], report["section_chunks"][key])})
                 next_id += 1
             if items:
-                claims += judge_claims(llm, items, r.get("provider"))
+                claims += judge_claims(llm, items, r.get("model"))
         out["claims"] = claims
         out["uncited_web_claims"] = uncited
 
@@ -99,6 +100,8 @@ def summarize(case_results: list) -> dict:
         "self_judged_share": _pct(sum(1 for c in judged if c.get("self_judged")), len(judged)),
         "uncited_web_claims": sum(r.get("uncited_web_claims", 0) for r in ok),
         "fake_citations_removed": sum(s["removed_citations"] for s in sections),
+        "uncited_source_points_downgraded": sum(s.get("downgraded", 0) for s in sections),
+        "models_used": sorted({s["model"] for s in sections if s.get("model")}),
         "relevance_rerank_on": _pct(sum(x["relevant"] for x in rel_on), sum(x["rated"] for x in rel_on)),
         "relevance_rerank_off": _pct(sum(x["relevant"] for x in rel_off), sum(x["rated"] for x in rel_off)),
         "tag_counts": tags,

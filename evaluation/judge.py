@@ -6,9 +6,9 @@
 2. Retrieval relevance: for every passage picked for a section, the judge says
    whether it's useful for writing that section.
 
-Cross-model judging: a claim written by Groq is judged by Gemini and vice
-versa, so no model grades its own writing. If only one model is available,
-the result is marked "self_judged".
+Cross-model judging: each claim is judged by a different model than the one
+that wrote it, so no model grades its own writing. If only that model is
+available, the result is marked "self_judged".
 """
 import json
 import re
@@ -70,24 +70,18 @@ def evidence_for(nums: list, chunks: list) -> str:
     return "\n".join(parts)[:EVIDENCE_CHARS_PER_CLAIM]
 
 
-def other_provider(llm, provider: str):
-    others = [p for p in llm.order if p != provider]
-    return others[0] if others else provider
-
-
-def judge_claims(llm, items: list, writer_provider: str) -> list:
+def judge_claims(llm, items: list, writer_model: str) -> list:
     """items: [{"id", "claim", "evidence"}]. Adds "verdict", "reason", "judge", "self_judged"."""
-    judge_pref = other_provider(llm, writer_provider)
     for start in range(0, len(items), CLAIMS_PER_CALL):
         batch = items[start:start + CLAIMS_PER_CALL]
         listing = "\n\n".join(f"Claim {it['id']}: {it['claim']}\nEvidence:\n{it['evidence']}" for it in batch)
         try:
-            answer = llm.chat(CLAIM_JUDGE_SYSTEM, listing, temperature=0.0, max_tokens=1500,
-                              prefer=judge_pref)
+            answer = llm.chat(CLAIM_JUDGE_SYSTEM, listing, temperature=0.0, max_tokens=1200,
+                              avoid_model=writer_model)
             data = parse_json(answer["text"]) or {}
             by_id = {int(v.get("id")): v for v in data.get("verdicts") or []
                      if isinstance(v, dict) and str(v.get("id", "")).isdigit()}
-            judge = answer["provider"]
+            judge = answer["model"]
         except Exception:
             by_id, judge = {}, None
         for it in batch:
@@ -96,7 +90,7 @@ def judge_claims(llm, items: list, writer_provider: str) -> list:
             it["verdict"] = verdict if verdict in VERDICTS else "judge_failed"
             it["reason"] = str(v.get("reason", ""))[:120]
             it["judge"] = judge
-            it["self_judged"] = judge == writer_provider
+            it["self_judged"] = judge == writer_model
     return items
 
 
@@ -107,9 +101,8 @@ def judge_relevance(llm, company: str, role: str, section_payload: list) -> dict
         passages = "\n".join(f"  ({i + 1}) {p[:PASSAGE_CHARS]}" for i, p in enumerate(s["passages"]))
         blocks.append(f"{s['sid']}: section \"{s['title']}\"\n{passages}")
     user = f"Company: {company}. Role: {role}.\n\n" + "\n\n".join(blocks)
-    prefer = "gemini" if "gemini" in llm.ready else None  # larger context window
     try:
-        answer = llm.chat(RELEVANCE_JUDGE_SYSTEM, user, temperature=0.0, max_tokens=800, prefer=prefer)
+        answer = llm.chat(RELEVANCE_JUDGE_SYSTEM, user, temperature=0.0, max_tokens=800, prefer="gemini")
         data = parse_json(answer["text"]) or {}
     except Exception:
         return {}
