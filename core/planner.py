@@ -36,7 +36,7 @@ def _parse_json(text: str):
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def plan_queries(company: str, role: str, location: str, level: str = "",
-                 provider: str = "groq") -> list:
+                 provider: str = "auto") -> list:
     """Returns [{"topic": ..., "query": ..., "source": "ai" | "template"}, ...]."""
     year = date.today().year
     needs = ", ".join(f'{count} for "{topic}"' for topic, count in TOPICS.items())
@@ -54,7 +54,7 @@ Rules: every query must include "{company}"; keep each under 12 words; make them
 
     ai_queries = {}
     try:
-        answer = LLM(provider).chat(PLANNER_SYSTEM, user, temperature=0.3, max_tokens=1500)
+        answer = LLM(provider).chat(PLANNER_SYSTEM, user, temperature=0.3, max_tokens=800)
         data = _parse_json(answer["text"]) or {}
         for item in data.get("queries") or []:
             if not isinstance(item, dict):

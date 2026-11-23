@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.sections import SECTIONS
 
 WEAK_SOURCE_THRESHOLD = 3  # fewer relevant chunks than this = "limited information"
-MAX_PARALLEL_SECTIONS = 3  # gentle on free-tier rate limits
+MAX_PARALLEL_SECTIONS = 6  # all at once; Auto mode splits them across two providers
 
 BASE_SYSTEM = """You write ONE section of an interview prep report.
 Labeling rules (very important):
@@ -86,7 +86,8 @@ def clean_citations(text: str, valid_nums: set):
     return CITATION.sub(fix, text), removed
 
 
-def write_section(llm, key: str, company: str, role: str, location: str, chunks: list) -> dict:
+def write_section(llm, key: str, company: str, role: str, location: str, chunks: list,
+                  prefer: str = None) -> dict:
     started = time.perf_counter()
     cfg = SECTIONS[key]
     weak = len(chunks) < WEAK_SOURCE_THRESHOLD
@@ -104,7 +105,7 @@ Instructions:
     result = {"key": key, "title": cfg["title"], "weak": weak, "provider": None,
               "model": None, "fallback": False, "removed_citations": [], "error": None}
     try:
-        answer = llm.chat(BASE_SYSTEM, user)
+        answer = llm.chat(BASE_SYSTEM, user, max_tokens=1500, prefer=prefer)
         text, removed = clean_citations(answer["text"], {c["num"] for c in chunks})
         result.update(text=text, provider=answer["provider"], model=answer["model"],
                       fallback=answer["fallback"], removed_citations=removed,
@@ -121,8 +122,8 @@ def write_report(llm, company: str, role: str, location: str, section_chunks: di
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_SECTIONS) as pool:
         futures = [
             pool.submit(write_section, llm, key, company, role, location,
-                        section_chunks.get(key) or [])
-            for key in SECTIONS
+                        section_chunks.get(key) or [], llm.preferred_for(i))
+            for i, key in enumerate(SECTIONS)
         ]
         for future in as_completed(futures):
             yield future.result()

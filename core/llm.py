@@ -1,16 +1,24 @@
-"""One place for talking to the LLMs: Groq (fast) and Google Gemini (backup).
+"""One place for talking to the LLMs: Groq and Google Gemini.
 
-LLM(primary) sets up both providers on the main thread. Its chat() method tries
-the chosen provider first and automatically falls back to the other one if a
-call fails (e.g. free-tier rate limit) or returns an empty answer. chat() makes
-no Streamlit calls, so it's safe to use from parallel worker threads.
+Speed design:
+- "Auto" mode splits the report's sections between Groq and Gemini, so neither
+  free tier gets overloaded and both work at the same time.
+- No waiting on rate limits: if a model is busy or slow, we switch to the other
+  one immediately (no retry pauses, short timeouts).
+- Reasoning/"thinking" is turned down where supported, since these are writing
+  tasks, not puzzles.
+
+LLM(mode) sets up both providers on the main thread. chat() makes no Streamlit
+calls, so it's safe to use from parallel worker threads.
 """
 import re
 
 import streamlit as st
 from groq import Groq
 
-PROVIDERS = {"groq": "Groq (fast)", "gemini": "Google Gemini"}
+PROVIDERS = {"auto": "Auto (fastest: uses both)", "groq": "Groq", "gemini": "Google Gemini"}
+REAL_PROVIDERS = ("groq", "gemini")
+CALL_TIMEOUT_SECONDS = 30
 
 GROQ_SKIP = ("guard", "whisper", "tts", "playai", "orpheus", "distil", "safeguard")
 GROQ_PREFERRED = ("llama-3.3-70b", "gpt-oss-120b", "70b", "versatile", "llama")
@@ -22,7 +30,7 @@ GEMINI_SKIP = ("image", "tts", "audio", "live", "embedding", "native", "vision",
 
 @st.cache_resource(show_spinner=False)
 def _groq_client():
-    return Groq(api_key=st.secrets["GROQ_API_KEY"], max_retries=1, timeout=60)
+    return Groq(api_key=st.secrets["GROQ_API_KEY"], max_retries=0, timeout=CALL_TIMEOUT_SECONDS)
 
 
 @st.cache_resource(show_spinner=False)
@@ -44,7 +52,12 @@ def _groq_model() -> str:
 @st.cache_resource(show_spinner=False)
 def _gemini_client():
     from google import genai
-    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    try:
+        from google.genai import types
+        return genai.Client(api_key=st.secrets["GEMINI_API_KEY"],
+                            http_options=types.HttpOptions(timeout=CALL_TIMEOUT_SECONDS * 1000))
+    except Exception:
+        return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
 def _gemini_rank(name: str):
@@ -79,28 +92,44 @@ def _gemini_model() -> str:
 # ---------------- Calls (no Streamlit inside: thread-safe) ----------------
 
 def _call_groq(client, model, system, user, temperature, max_tokens) -> str:
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
+    kwargs = dict(
+        model=model, temperature=temperature, max_tokens=max_tokens,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
     )
+    if "gpt-oss" in model.lower():
+        kwargs["reasoning_effort"] = "low"  # writing task: little "thinking" needed
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        if "reasoning" not in str(e).lower() or "reasoning_effort" not in kwargs:
+            raise
+        kwargs.pop("reasoning_effort")  # model/SDK doesn't support it: retry plainly
+        response = client.chat.completions.create(**kwargs)
     return (response.choices[0].message.content or "").strip()
 
 
 def _call_gemini(client, model, system, user, temperature, max_tokens) -> str:
     from google.genai import types
-    response = client.models.generate_content(
-        model=model,
-        contents=user,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        ),
-    )
-    return (getattr(response, "text", None) or "").strip()
+    base = dict(system_instruction=system, temperature=temperature, max_output_tokens=max_tokens)
+    configs = []
+    if "2.5-flash" in model.lower():
+        try:  # turn off "thinking" on 2.5 Flash for speed
+            configs.append(types.GenerateContentConfig(
+                **base, thinking_config=types.ThinkingConfig(thinking_budget=0)))
+        except Exception:
+            pass
+    configs.append(types.GenerateContentConfig(**base))
+
+    last_error = None
+    for config in configs:
+        try:
+            response = client.models.generate_content(model=model, contents=user, config=config)
+            return (getattr(response, "text", None) or "").strip()
+        except Exception as e:
+            last_error = e
+            if "thinking" not in str(e).lower():
+                raise
+    raise last_error
 
 
 _CALLERS = {"groq": _call_groq, "gemini": _call_gemini}
@@ -108,14 +137,16 @@ _SETUP = {"groq": (_groq_client, _groq_model), "gemini": (_gemini_client, _gemin
 
 
 class LLM:
-    def __init__(self, primary: str = "groq"):
+    def __init__(self, mode: str = "auto"):
+        self.mode = mode
         self.ready, self.setup_errors = {}, {}
         for name, (get_client, get_model) in _SETUP.items():
             try:
                 self.ready[name] = (get_client(), get_model())
             except Exception as e:
                 self.setup_errors[name] = f"{type(e).__name__}: {e}"
-        order = [primary] + [p for p in PROVIDERS if p != primary]
+        first = mode if mode in REAL_PROVIDERS else "groq"
+        order = [first] + [p for p in REAL_PROVIDERS if p != first]
         self.order = [p for p in order if p in self.ready]
         if not self.order:
             raise RuntimeError(f"No AI model available. Details: {self.setup_errors}")
@@ -123,11 +154,20 @@ class LLM:
     def model_name(self, provider: str) -> str:
         return self.ready[provider][1] if provider in self.ready else "unavailable"
 
+    def preferred_for(self, index: int):
+        """In Auto mode, alternate sections between providers to split the load."""
+        if self.mode == "auto" and len(self.ready) == 2:
+            return REAL_PROVIDERS[index % 2]
+        return None
+
     def chat(self, system: str, user: str, temperature: float = 0.3,
-             max_tokens: int = 3000) -> dict:
+             max_tokens: int = 3000, prefer: str = None) -> dict:
         """Returns {"text", "provider", "model", "fallback", "errors"}."""
+        order = self.order
+        if prefer in self.ready:
+            order = [prefer] + [p for p in self.order if p != prefer]
         errors = []
-        for i, provider in enumerate(self.order):
+        for i, provider in enumerate(order):
             client, model = self.ready[provider]
             try:
                 text = _CALLERS[provider](client, model, system, user, temperature, max_tokens)
