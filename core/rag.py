@@ -40,3 +40,5 @@ def retrieve(pages: list[dict], query: str, top_k: int = 6,
     ]
     splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
     index = VectorStoreIndex.from_documents(documents, transformations=[splitter], embed_model=get_embed_model())
+    # Fetch extra candidates, then cap chunks per page so one page can't dominate
+    candidates = index.as_retriever(similarity_top_k=top_k * 4).retrieve(query)
