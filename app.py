@@ -5,16 +5,13 @@ import traceback
 import streamlit as st
 import streamlit.components.v1 as components
 
-from core.generate import assign_source_numbers, write_report
-from core.llm import LLM, PROVIDERS
+from core.llm import PROVIDERS
 from core.pdf_report import build_pdf
-from core.planner import plan_queries
-from core.profile import (LEVELS, ROUNDS, is_personal, jd_for_planner, level_search_words,
-                          make_profile, read_resume)
-from core.rag import build_index, reranker_available, retrieve_for_section
-from core.search import run_searches
+from core.pipeline import NoDataError, run_pipeline
+from core.profile import LEVELS, ROUNDS, is_personal, make_profile, read_resume
+from core.rag import reranker_available
 from core.sections import SECTIONS
-from ui.theme import (CSS, SCROLL_TO_REPORT_JS, STEPS, footer_html, hero_html, report_head_html,
+from ui.theme import (CSS, SCROLL_TO_REPORT_JS, footer_html, hero_html, report_head_html,
                       section_markdown, sources_html, tracker_html)
 
 REPORT_TTL_SECONDS = 24 * 60 * 60
@@ -29,6 +26,11 @@ EXAMPLES = [  # (chip label, company, role, location)
 st.set_page_config(page_title="HappyInterviews: AI interview prep", page_icon="🎯", layout="wide")
 st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
 DEBUG = st.query_params.get("debug") == "1"
+
+if st.query_params.get("eval") == "1":  # hidden evaluation dashboard
+    from evaluation.page import render_eval_page
+    render_eval_page()
+    st.stop()
 
 
 class FriendlyError(Exception):
@@ -96,65 +98,25 @@ tracker = st.empty()
 
 # ------------------------------------------------------------------ Pipeline
 def build_report(company: str, role: str, location: str, provider: str, profile: dict) -> dict:
-    timings, results = {}, {}
-
     def show(step: int, detail: str, progress: float = None):
         tracker.markdown(tracker_html(step, detail, progress), unsafe_allow_html=True)
 
-    llm = LLM(provider)
-
-    show(0, f"Deciding what to search for about {company}...")
-    t = time.perf_counter()
-    plan = plan_queries(company, role, location, level_search_words(profile),
-                        provider, profile["round"], jd_for_planner(profile))
-    timings["Planning"] = time.perf_counter() - t
-
-    show(1, f"Running {len(plan)} searches at once...")
-    t = time.perf_counter()
-    pages = run_searches(plan)
-    timings["Searching"] = time.perf_counter() - t
-    if not pages:
-        raise FriendlyError(f"We couldn't find enough public information about {company}. "
-                            "Check the spelling, or try the company's full name.")
-
-    show(2, f"Reading {len(pages)} web pages...")
-    t = time.perf_counter()
-    index = build_index(pages)
-    timings["Reading"] = time.perf_counter() - t
-    if not index["chunks"]:
-        raise FriendlyError("The pages we found didn't contain readable text. Please try again in a few minutes.")
-
-    show(3, "Matching the most useful passages to each part of your report...")
-    t = time.perf_counter()
-    fmt = {"company": company, "role": role, "location": location}
-    section_chunks = {key: retrieve_for_section(index, cfg["query"].format(**fmt), cfg["topics"])
-                      for key, cfg in SECTIONS.items()}
-    sources = assign_source_numbers(section_chunks)
-    timings["Matching"] = time.perf_counter() - t
-
-    show(4, f"Writing 6 sections at once: 0 of {len(SECTIONS)} ready", 4 / 5)
-    t = time.perf_counter()
-    for result in write_report(llm, company, role, location, section_chunks, profile):
-        results[result["key"]] = result
-        ready = sum(1 for r in results.values() if not r["error"])
-        show(4, f"Writing 6 sections at once: {ready} of {len(SECTIONS)} ready",
-             (4 + ready / len(SECTIONS)) / 5)
-    timings["Writing"] = time.perf_counter() - t
-    tracker.empty()
-
-    failed = sum(1 for r in results.values() if r["error"])
-    pdf, pdf_error = None, None
     try:
-        pdf = build_pdf(company, role, location, profile, results, SECTIONS, sources)
-    except Exception as e:
-        pdf_error = f"{type(e).__name__}: {e}"
+        report = run_pipeline(company, role, location, provider, profile, on_progress=show)
+    except NoDataError as e:
+        raise FriendlyError(str(e))
+    finally:
+        tracker.empty()
 
-    return {
-        "results": results, "sources": sources, "plan": plan, "timings": timings,
-        "section_chunks": section_chunks, "n_pages": len(pages), "n_chunks": len(index["chunks"]),
-        "failed": failed, "setup_errors": llm.setup_errors, "created": time.time(),
-        "pdf": pdf, "pdf_error": pdf_error,
-    }
+    report.pop("index", None)  # large and only needed by the evaluation
+    report.pop("llm", None)
+    report["pdf"], report["pdf_error"] = None, None
+    try:
+        report["pdf"] = build_pdf(company, role, location, profile, report["results"],
+                                  SECTIONS, report["sources"])
+    except Exception as e:
+        report["pdf_error"] = f"{type(e).__name__}: {e}"
+    return report
 
 
 # ------------------------------------------------------------------ Report view
