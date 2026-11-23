@@ -1,8 +1,25 @@
 """Chunking, embedding and retrieval with LlamaIndex + FastEmbed."""
-import streamlit as st
-from llama_index.core import Document, VectorStoreIndex
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
+import os
+
+import nltk
+
+# --- NLTK setup: use a private folder that only this app can write to ---
+NLTK_DIR = os.path.join(os.path.expanduser("~"), ".happy_nltk_data")
+os.makedirs(NLTK_DIR, mode=0o700, exist_ok=True)
+os.environ["NLTK_DATA"] = NLTK_DIR          # LlamaIndex reads this
+nltk.data.path.insert(0, NLTK_DIR)          # NLTK checks this folder first
+for package, resource in [("stopwords", "corpora/stopwords"),
+                          ("punkt_tab", "tokenizers/punkt_tab")]:
+    try:
+        nltk.data.find(resource)
+    except LookupError:
+        nltk.download(package, download_dir=NLTK_DIR, quiet=True)
+# -------------------------------------------------------------------------
+
+import streamlit as st  # noqa: E402
+from llama_index.core import Document, VectorStoreIndex  # noqa: E402
+from llama_index.core.node_parser import SentenceSplitter  # noqa: E402
+from llama_index.embeddings.fastembed import FastEmbedEmbedding  # noqa: E402
 
 
 @st.cache_resource(show_spinner=False)
