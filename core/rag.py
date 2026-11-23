@@ -1,44 +1,77 @@
-"""Chunking, embedding and retrieval with LlamaIndex + FastEmbed."""
-import os
+"""Chunking, embedding and retrieval.
 
-import nltk
+Built directly on FastEmbed + NumPy (no LlamaIndex), so there are no hidden
+NLTK downloads and every step is easy to explain:
+  1. split each page into overlapping word windows (chunks)
+  2. turn chunks and the query into vectors (embeddings)
+  3. rank chunks by cosine similarity to the query
+  4. keep the top results, max 2 per page for source diversity
+"""
+import numpy as np
+import streamlit as st
+from fastembed import TextEmbedding
 
-# --- NLTK setup: use a private folder that only this app can write to ---
-NLTK_DIR = os.path.join(os.path.expanduser("~"), ".happy_nltk_data")
-os.makedirs(NLTK_DIR, mode=0o700, exist_ok=True)
-os.environ["NLTK_DATA"] = NLTK_DIR          # LlamaIndex reads this
-nltk.data.path.insert(0, NLTK_DIR)          # NLTK checks this folder first
-for package, resource in [("stopwords", "corpora/stopwords"),
-                          ("punkt_tab", "tokenizers/punkt_tab")]:
-    try:
-        nltk.data.find(resource)
-    except LookupError:
-        nltk.download(package, download_dir=NLTK_DIR, quiet=True)
-# -------------------------------------------------------------------------
-
-import streamlit as st  # noqa: E402
-from llama_index.core import Document, VectorStoreIndex  # noqa: E402
-from llama_index.core.node_parser import SentenceSplitter  # noqa: E402
-from llama_index.embeddings.fastembed import FastEmbedEmbedding  # noqa: E402
+CHUNK_WORDS = 220    # about 300 tokens per chunk
+OVERLAP_WORDS = 40   # overlap so sentences cut at a boundary aren't lost
+MIN_CHUNK_WORDS = 40
 
 
 @st.cache_resource(show_spinner=False)
-def get_embed_model():
+def get_embedder():
     # Small, free embedding model that runs inside the app (no API needed)
-    return FastEmbedEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    return TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
 
-def retrieve(pages: list[dict], query: str, top_k: int = 6,
-             max_per_source: int = 2) -> list[dict]:
-    documents = [
-        Document(
-            text=p["text"],
-            metadata={"url": p["url"], "title": p["title"]},
-            excluded_embed_metadata_keys=["url"],
-        )
-        for p in pages
-    ]
-    splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
-    index = VectorStoreIndex.from_documents(documents, transformations=[splitter], embed_model=get_embed_model())
-    # Fetch extra candidates, then cap chunks per page so one page can't dominate
-    candidates = index.as_retriever(similarity_top_k=top_k * 4).retrieve(query)
+def chunk_text(text: str) -> list:
+    words = (text or "").split()
+    if not words:
+        return []
+    step = CHUNK_WORDS - OVERLAP_WORDS
+    chunks = []
+    for start in range(0, len(words), step):
+        piece = words[start:start + CHUNK_WORDS]
+        if len(piece) < MIN_CHUNK_WORDS and chunks:
+            break  # tiny leftover tail is already covered by the overlap
+        chunks.append(" ".join(piece))
+        if start + CHUNK_WORDS >= len(words):
+            break
+    return chunks
+
+
+def _normalize(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vectors / norms
+
+
+def rank_chunks(chunk_vecs: np.ndarray, query_vec: np.ndarray) -> np.ndarray:
+    """Cosine similarity of every chunk to the query."""
+    return _normalize(chunk_vecs) @ _normalize(query_vec.reshape(1, -1))[0]
+
+
+def pick_diverse(chunks: list, scores: np.ndarray, top_k: int, max_per_source: int) -> list:
+    picked, count_per_url = [], {}
+    for i in np.argsort(-scores):
+        c = chunks[int(i)]
+        if count_per_url.get(c["url"], 0) >= max_per_source:
+            continue
+        count_per_url[c["url"]] = count_per_url.get(c["url"], 0) + 1
+        picked.append({**c, "score": round(float(scores[i]), 3)})
+        if len(picked) == top_k:
+            break
+    return picked
+
+
+def retrieve(pages: list, query: str, top_k: int = 6, max_per_source: int = 2) -> list:
+    chunks = []
+    for p in pages or []:
+        for piece in chunk_text(p.get("text")):
+            chunks.append({"text": piece, "url": p["url"], "title": p["title"]})
+    if not chunks:
+        return []
+
+    embedder = get_embedder()
+    chunk_vecs = np.array(list(embedder.passage_embed([c["text"] for c in chunks])))
+    query_vec = np.array(list(embedder.query_embed([query])))[0]
+    scores = rank_chunks(chunk_vecs, query_vec)
+    return pick_diverse(chunks, scores, top_k, max_per_source)

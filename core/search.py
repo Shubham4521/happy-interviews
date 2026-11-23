@@ -1,4 +1,4 @@
-"""Web search with Tavily, plus basic cleaning. Cached for 24 hours to save quota."""
+"""Web search with Tavily, plus basic cleaning. Results are cached for 24 hours."""
 import re
 from datetime import date
 
@@ -10,8 +10,10 @@ EXCLUDED_DOMAINS = ["scribd.com", "slideshare.net", "pdfcoffee.com", "studocu.co
 LONG_TOKEN = re.compile(r"\S{40,}")  # encoded data, long URLs, junk strings
 
 
-def clean_text(text: str) -> str:
-    text = LONG_TOKEN.sub(" ", text)
+def clean_text(text) -> str:
+    if not text:
+        return ""
+    text = LONG_TOKEN.sub(" ", str(text))
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -20,12 +22,12 @@ def looks_like_real_text(text: str) -> bool:
     words = text.split()
     if len(words) < 80:
         return False
-    alphabetic_share = sum(w.strip(".,;:!?()\"'").isalpha() for w in words) / len(words)
-    return alphabetic_share > 0.6
+    alphabetic = sum(w.strip(".,;:!?()\"'").isalpha() for w in words)
+    return alphabetic / len(words) > 0.6
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def search_company(company: str, location: str) -> list[dict]:
+def search_company(company: str, location: str) -> list:
     client = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
     year = date.today().year
     queries = [
@@ -36,20 +38,24 @@ def search_company(company: str, location: str) -> list[dict]:
 
     pages, seen_urls = [], set()
     for query in queries:
-        response = client.search(
-            query,
-            max_results=5,
-            include_raw_content=True,
-            exclude_domains=EXCLUDED_DOMAINS,
-        )
-        for r in response.get("results", []):
+        try:
+            response = client.search(
+                query,
+                max_results=5,
+                include_raw_content=True,
+                exclude_domains=EXCLUDED_DOMAINS,
+            ) or {}
+        except Exception:
+            continue  # one failed search shouldn't break the whole report
+
+        for r in response.get("results") or []:
             url = r.get("url")
             if not url or url in seen_urls:
                 continue
-            text = clean_text(r.get("raw_content") or "")
+            text = clean_text(r.get("raw_content"))
             if not looks_like_real_text(text):
                 # Fall back to Tavily's short summary if the full page is junk
-                text = clean_text(r.get("content") or "")
+                text = clean_text(r.get("content"))
                 if len(text.split()) < 30:
                     continue
             seen_urls.add(url)
