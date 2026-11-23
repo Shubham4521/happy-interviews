@@ -81,6 +81,7 @@ WEAK_NOTE = """Very few relevant sources were found. Start the section with exac
 Then mark points 💡 (or 💼) unless a source clearly supports them."""
 
 CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+ODD_CITATION = re.compile(r"[\[【](\d+)(?:†[^\]】]*)?[\]】]")  # e.g. 【3†source】 or [3†L1-L4]
 
 
 def assign_source_numbers(section_chunks: dict) -> list:
@@ -96,7 +97,12 @@ def assign_source_numbers(section_chunks: dict) -> list:
 
 
 def clean_citations(text: str, valid_nums: set):
-    """Removes citation numbers that weren't in this section's sources. Returns (text, removed)."""
+    """Guardrail on the model's citations:
+    1. normalizes unusual formats like 【3†source】 to [3],
+    2. removes citation numbers that weren't in this section's sources,
+    3. downgrades a Source-tagged line with no citation left to an AI tip, so the
+       Source label never promises a link the reader can't open.
+    Returns (text, removed_numbers, downgraded_lines)."""
     removed = []
 
     def fix(match):
@@ -105,7 +111,15 @@ def clean_citations(text: str, valid_nums: set):
         removed.extend(n for n in nums if n not in valid_nums)
         return "".join(f"[{n}]" for n in keep)
 
-    return CITATION.sub(fix, text), removed
+    text = ODD_CITATION.sub(lambda m: f"[{m.group(1)}]", text)
+    text = CITATION.sub(fix, text)
+    lines, downgraded = [], 0
+    for line in text.splitlines():
+        if "🌐" in line and not CITATION.search(line):
+            line = line.replace("🌐", "💡")
+            downgraded += 1
+        lines.append(line)
+    return "\n".join(lines), removed, downgraded
 
 
 def write_section(llm, key: str, company: str, role: str, location: str, chunks: list,
@@ -129,13 +143,13 @@ Instructions:
 {WEAK_NOTE if weak else ''}"""
 
     result = {"key": key, "title": cfg["title"], "weak": weak, "provider": None,
-              "model": None, "fallback": False, "removed_citations": [], "error": None,
-              "retried": False}
+              "model": None, "fallback": False, "removed_citations": [], "downgraded": 0,
+              "error": None, "retried": False}
     try:
-        answer = llm.chat(BASE_SYSTEM, user, max_tokens=1500, prefer=prefer)
-        text, removed = clean_citations(answer["text"], {c["num"] for c in chunks})
+        answer = llm.chat(BASE_SYSTEM, user, max_tokens=1000, prefer=prefer)
+        text, removed, downgraded = clean_citations(answer["text"], {c["num"] for c in chunks})
         result.update(text=text, provider=answer["provider"], model=answer["model"],
-                      fallback=answer["fallback"], removed_citations=removed,
+                      fallback=answer["fallback"], removed_citations=removed, downgraded=downgraded,
                       provider_errors=answer["errors"])
     except Exception as e:
         result.update(text="⚠️ Couldn't generate this section right now. Please try again in a minute.",
@@ -164,10 +178,9 @@ def write_report(llm, company: str, role: str, location: str, section_chunks: di
     keys = list(SECTIONS)
     for i, first_try in enumerate(failed):
         time.sleep(RETRY_DELAY_SECONDS if i == 0 else 1)  # let rate limits cool down
-        first_choice = llm.preferred_for(keys.index(first_try["key"])) or llm.order[0]
-        others = [p for p in llm.order if p != first_choice]
+        # start the retry on a different model than the first attempt
         result = write_section(llm, first_try["key"], company, role, location,
                                section_chunks.get(first_try["key"]) or [],
-                               prefer=others[0] if others else None, profile=profile)
+                               prefer=llm.preferred_for(keys.index(first_try["key"]) + 1), profile=profile)
         result["retried"] = True
         yield result

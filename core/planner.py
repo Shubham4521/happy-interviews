@@ -72,7 +72,7 @@ Rules: every query must include "{company}"; keep each under 12 words; make them
 
     ai_queries = {}
     try:
-        answer = LLM(provider).chat(PLANNER_SYSTEM, user, temperature=0.3, max_tokens=800)
+        answer = LLM(provider).chat(PLANNER_SYSTEM, user, temperature=0.3, max_tokens=600)
         data = _parse_json(answer["text"]) or {}
         for item in data.get("queries") or []:
             if not isinstance(item, dict):
