@@ -18,6 +18,10 @@ OVERLAP_WORDS = 40     # overlap so sentences cut at a boundary aren't lost
 MIN_CHUNK_WORDS = 40
 TOPIC_BOOST = 0.05     # nudge chunks from searches meant for this section
 RERANK_CANDIDATES = 20
+EMBED_BATCH_SIZE = 16  # small batches keep memory low on free hosting
+RERANK_BATCH_SIZE = 8
+MAX_CHUNKS_PER_PAGE = 6
+MAX_TOTAL_CHUNKS = 180
 
 
 @st.cache_resource(show_spinner=False)
@@ -61,16 +65,18 @@ def build_index(pages: list) -> dict:
     """Chunks every page and embeds all chunks once. Reused by every section."""
     chunks = []
     for p in pages or []:
-        for piece in chunk_text(p.get("text")):
+        for piece in chunk_text(p.get("text"))[:MAX_CHUNKS_PER_PAGE]:
             chunks.append({
                 "text": piece,
                 "url": p["url"],
                 "title": p["title"],
                 "topics": p.get("topics") or [],
             })
+    chunks = chunks[:MAX_TOTAL_CHUNKS]
     if not chunks:
         return {"chunks": [], "vectors": np.zeros((0, 1))}
-    vectors = np.array(list(get_embedder().passage_embed([c["text"] for c in chunks])))
+    vectors = np.array(list(get_embedder().passage_embed(
+        [c["text"] for c in chunks], batch_size=EMBED_BATCH_SIZE)))
     return {"chunks": chunks, "vectors": _normalize(vectors)}
 
 
@@ -79,7 +85,8 @@ def _rerank(query: str, candidates: list) -> list:
     if reranker is None or not candidates:
         return candidates
     try:
-        scores = list(reranker.rerank(query, [c["text"] for c in candidates]))
+        scores = list(reranker.rerank(query, [c["text"] for c in candidates],
+                                      batch_size=RERANK_BATCH_SIZE))
         if len(scores) != len(candidates):
             return candidates
         for c, s in zip(candidates, scores):
