@@ -9,7 +9,7 @@ from datetime import date
 
 import streamlit as st
 
-from core.llm import chat
+from core.llm import LLM
 from core.sections import FALLBACK_QUERIES, TOPICS
 
 PLANNER_SYSTEM = """You plan web searches for interview preparation research.
@@ -35,7 +35,8 @@ def _parse_json(text: str):
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
-def plan_queries(company: str, role: str, location: str, level: str = "") -> list:
+def plan_queries(company: str, role: str, location: str, level: str = "",
+                 provider: str = "groq") -> list:
     """Returns [{"topic": ..., "query": ..., "source": "ai" | "template"}, ...]."""
     year = date.today().year
     needs = ", ".join(f'{count} for "{topic}"' for topic, count in TOPICS.items())
@@ -53,7 +54,8 @@ Rules: every query must include "{company}"; keep each under 12 words; make them
 
     ai_queries = {}
     try:
-        data = _parse_json(chat(PLANNER_SYSTEM, user, temperature=0.3, max_tokens=1500)) or {}
+        answer = LLM(provider).chat(PLANNER_SYSTEM, user, temperature=0.3, max_tokens=1500)
+        data = _parse_json(answer["text"]) or {}
         for item in data.get("queries") or []:
             if not isinstance(item, dict):
                 continue
