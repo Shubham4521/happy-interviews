@@ -1,3 +1,5 @@
+import traceback
+
 import streamlit as st
 
 from core.generate import company_snapshot, pick_model
@@ -17,6 +19,7 @@ with st.form("inputs"):
     submitted = st.form_submit_button("Generate", type="primary")
 
 if submitted:
+    company, role, location = company.strip(), role.strip(), location.strip()
     if not (company and role and location):
         st.warning("Please fill in company, role and location.")
         st.stop()
@@ -24,21 +27,27 @@ if submitted:
     try:
         with st.status("Preparing your report...", expanded=True) as status:
             st.write("🔎 Searching the web...")
-            pages = search_company(company.strip(), location.strip())
+            pages = search_company(company, location)
             if not pages:
                 status.update(label="No sources found", state="error")
-                st.error("Couldn't find information about this company. Check the spelling?")
+                st.error("Couldn't find usable information about this company. Check the spelling?")
                 st.stop()
 
             st.write(f"📚 Reading {len(pages)} pages and finding the most relevant parts...")
             query = f"{company} business overview, products, scale, recent news, work culture"
             chunks = retrieve(pages, query, top_k=6)
+            if not chunks:
+                status.update(label="Nothing relevant found", state="error")
+                st.error("The pages found didn't contain usable text. Try again later.")
+                st.stop()
 
             st.write("✍️ Writing your snapshot...")
             snapshot, sources = company_snapshot(company, role, location, chunks)
             status.update(label="Done!", state="complete", expanded=False)
     except Exception as e:
         st.error(f"Something went wrong: {type(e).__name__}: {e}")
+        with st.expander("Error details (paste these when asking for help)"):
+            st.code(traceback.format_exc())
         st.stop()
 
     st.markdown(f"## {company}: Company snapshot")
@@ -48,7 +57,7 @@ if submitted:
     for s in sources:
         st.markdown(f"[{s['num']}] [{s['title']}]({s['url']})")
 
-    st.caption(f"Model: {pick_model()}")
+    st.caption(f"Model: {pick_model()} · {len(pages)} pages read · {len(chunks)} chunks used")
 
     with st.expander("🔧 Debug: retrieved chunks"):
         for c in chunks:
