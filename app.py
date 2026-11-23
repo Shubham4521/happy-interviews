@@ -6,6 +6,8 @@ import streamlit as st
 from core.generate import assign_source_numbers, write_report
 from core.llm import LLM, PROVIDERS
 from core.planner import plan_queries
+from core.profile import (LEVELS, ROUNDS, is_personal, jd_for_planner, level_search_words,
+                          make_profile, read_resume)
 from core.rag import build_index, reranker_available, retrieve_for_section
 from core.search import run_searches
 from core.sections import SECTIONS
@@ -35,16 +37,24 @@ with st.sidebar:
 
 st.title("🎯 HappyInterviews")
 st.subheader("Your AI interview prep assistant")
-st.caption("Phase 3 preview: full 6-section report. Styling arrives in Phase 5.")
+st.caption("Phase 4 preview: personalized 6-section report. Styling arrives in Phase 5.")
 
 with st.form("inputs"):
     company = st.text_input("Company", placeholder="e.g. Swiggy")
     role = st.text_input("Role", placeholder="e.g. Data Analyst")
     location = st.text_input("Location", placeholder="e.g. Bengaluru")
+    with st.expander("✨ Personalize your report (optional)"):
+        level = st.selectbox("Experience level", LEVELS)
+        round_type = st.selectbox("Interview round", ROUNDS)
+        jd_text = st.text_area("Job description", height=150,
+                               placeholder="Paste the job description here")
+        resume_file = st.file_uploader("Resume (PDF)", type=["pdf"])
+        st.caption("🔒 Your resume and job description are used only for this report. "
+                   "They are never saved, shared, or sent to the web search.")
     submitted = st.form_submit_button("Generate report", type="primary")
 
 
-def build_report(company: str, role: str, location: str, provider: str) -> dict:
+def build_report(company: str, role: str, location: str, provider: str, profile: dict) -> dict:
     """Runs the whole pipeline, showing progress. Returns everything needed to display it."""
     timings, results = {}, {}
     with st.status("Preparing your report...", expanded=True) as status:
@@ -52,7 +62,8 @@ def build_report(company: str, role: str, location: str, provider: str) -> dict:
 
         t = time.perf_counter()
         st.write("🧭 Planning searches...")
-        plan = plan_queries(company, role, location, provider=provider)
+        plan = plan_queries(company, role, location, level_search_words(profile),
+                            provider, profile["round"], jd_for_planner(profile))
         timings["Planning"] = time.perf_counter() - t
 
         t = time.perf_counter()
@@ -85,10 +96,11 @@ def build_report(company: str, role: str, location: str, provider: str) -> dict:
 
         t = time.perf_counter()
         st.write("✍️ Writing all 6 sections at once...")
-        for result in write_report(llm, company, role, location, section_chunks):
+        for result in write_report(llm, company, role, location, section_chunks, profile):
             results[result["key"]] = result
             mark = "⚠️" if result["error"] else "✅"
-            st.write(f"{mark} {result['title']} ({result['seconds']}s)")
+            retry = "🔁 Retried: " if result["retried"] else ""
+            st.write(f"{retry}{mark} {result['title']} ({result['seconds']}s)")
         timings["Writing (parallel)"] = time.perf_counter() - t
 
         failed = sum(1 for r in results.values() if r["error"])
@@ -106,11 +118,26 @@ def build_report(company: str, role: str, location: str, provider: str) -> dict:
     }
 
 
-def show_report(report: dict, company: str, role: str, location: str, from_cache: bool):
+def show_report(report: dict, company: str, role: str, location: str, from_cache: bool,
+                profile: dict):
     results, sources, timings = report["results"], report["sources"], report["timings"]
 
     st.markdown(f"## {company} · {role} · {location}")
-    st.caption("🌐 = from the web, with source number · 💡 = AI suggestion")
+    details = []
+    if profile["level"] != "Not specified":
+        details.append(profile["level"])
+    if profile["round"] != "All rounds":
+        details.append(f"{profile['round']} round")
+    if profile["jd"]:
+        details.append("using your job description")
+    if profile["resume"]:
+        details.append("using your resume")
+    if details:
+        st.caption("Personalized: " + " · ".join(details))
+    legend = "🌐 = from the web, with source number · 💡 = AI suggestion"
+    if is_personal(profile):
+        legend += " · 💼 = from your resume / job description"
+    st.caption(legend)
 
     tabs = st.tabs([cfg["title"] for cfg in SECTIONS.values()])
     for tab, key in zip(tabs, SECTIONS):
@@ -140,7 +167,7 @@ def show_report(report: dict, company: str, role: str, location: str, from_cache
             if r["error"]:
                 st.markdown(f"- **{r['title']}**: ❌ {r['error']}")
                 continue
-            note = " (fallback)" if r["fallback"] else ""
+            note = (" (fallback)" if r["fallback"] else "") + (" (retried)" if r.get("retried") else "")
             weak = " · ⚠️ weak sources" if r["weak"] else ""
             fake = f" · removed fake citations {r['removed_citations']}" if r["removed_citations"] else ""
             st.markdown(f"- **{r['title']}**: {r['model']}{note} · {r['seconds']}s{weak}{fake}")
@@ -175,21 +202,28 @@ if submitted:
         st.warning("Please fill in company, role and location.")
         st.stop()
 
+    resume_text, resume_note = read_resume(resume_file.getvalue() if resume_file else b"")
+    if resume_note:
+        st.warning(resume_note)
+    profile = make_profile(level, round_type, jd_text, resume_text)
+
+    # Reports using a resume or JD are private: never saved to or loaded from the shared cache
     store = report_store()
-    cache_key = (company.lower(), role.lower(), location.lower())
-    saved = store.get(cache_key)
+    cache_key = (company.lower(), role.lower(), location.lower(), profile["level"], profile["round"])
+    can_cache = not is_personal(profile)
+    saved = store.get(cache_key) if can_cache else None
     if saved and not fresh and time.time() - saved["created"] < REPORT_TTL_SECONDS:
-        show_report(saved, company, role, location, from_cache=True)
+        show_report(saved, company, role, location, from_cache=True, profile=profile)
         st.stop()
 
     try:
-        report = build_report(company, role, location, provider)
+        report = build_report(company, role, location, provider, profile)
     except Exception as e:
         st.error(f"Something went wrong: {type(e).__name__}: {e}")
         with st.expander("Error details (paste these when asking for help)"):
             st.code(traceback.format_exc())
         st.stop()
 
-    if not report["failed"]:
-        store[cache_key] = report  # only keep complete reports
-    show_report(report, company, role, location, from_cache=False)
+    if can_cache and not report["failed"]:
+        store[cache_key] = report  # only keep complete, non-personal reports
+    show_report(report, company, role, location, from_cache=False, profile=profile)
