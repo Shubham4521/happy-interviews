@@ -1,50 +1,57 @@
 import streamlit as st
 
+from core.generate import company_snapshot, pick_model
+from core.rag import retrieve
+from core.search import search_company
+
 st.set_page_config(page_title="HappyInterviews", page_icon="🎯", layout="centered")
 
 st.title("🎯 HappyInterviews")
 st.subheader("Your AI interview prep assistant")
-st.write(
-    "Enter a company, role and location, and get a researched prep report: "
-    "company snapshot, interview process, likely questions, talking points and more, "
-    "with sources for everything."
-)
-st.info("🚧 Under construction. Phase 0: setup check.")
+st.caption("Phase 1 preview: company snapshot with sources.")
 
-st.divider()
-st.markdown("#### System check")
-st.caption("Confirms that all three services are connected. Keys stay private in Streamlit Secrets.")
+with st.form("inputs"):
+    company = st.text_input("Company", placeholder="e.g. Swiggy")
+    role = st.text_input("Role", placeholder="e.g. Data Analyst")
+    location = st.text_input("Location", placeholder="e.g. Bengaluru")
+    submitted = st.form_submit_button("Generate", type="primary")
 
+if submitted:
+    if not (company and role and location):
+        st.warning("Please fill in company, role and location.")
+        st.stop()
 
-def check_tavily():
-    from tavily import TavilyClient
-    client = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
-    result = client.search("Swiggy company overview", max_results=1)
-    return f"Search works ({len(result.get('results', []))} result returned)"
+    try:
+        with st.status("Preparing your report...", expanded=True) as status:
+            st.write("🔎 Searching the web...")
+            pages = search_company(company.strip(), location.strip())
+            if not pages:
+                status.update(label="No sources found", state="error")
+                st.error("Couldn't find information about this company. Check the spelling?")
+                st.stop()
 
+            st.write(f"📚 Reading {len(pages)} pages and finding the most relevant parts...")
+            query = f"{company} business overview, products, scale, recent news, work culture"
+            chunks = retrieve(pages, query, top_k=6)
 
-def check_groq():
-    from groq import Groq
-    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-    models = client.models.list()
-    return f"Connected ({len(models.data)} models available)"
+            st.write("✍️ Writing your snapshot...")
+            snapshot, sources = company_snapshot(company, role, location, chunks)
+            status.update(label="Done!", state="complete", expanded=False)
+    except Exception as e:
+        st.error(f"Something went wrong: {type(e).__name__}: {e}")
+        st.stop()
 
+    st.markdown(f"## {company}: Company snapshot")
+    st.markdown(snapshot)
 
-def check_gemini():
-    from google import genai
-    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    models = list(client.models.list())
-    return f"Connected ({len(models)} models available)"
+    st.markdown("#### Sources")
+    for s in sources:
+        st.markdown(f"[{s['num']}] [{s['title']}]({s['url']})")
 
+    st.caption(f"Model: {pick_model()}")
 
-if st.button("Run system check", type="primary"):
-    for name, check in [("Tavily (web search)", check_tavily),
-                        ("Groq (free LLM)", check_groq),
-                        ("Gemini (backup LLM)", check_gemini)]:
-        with st.spinner(f"Checking {name}..."):
-            try:
-                st.success(f"✅ {name}: {check()}")
-            except KeyError:
-                st.error(f"❌ {name}: API key missing in Secrets")
-            except Exception as e:
-                st.error(f"❌ {name}: {type(e).__name__}: {e}")
+    with st.expander("🔧 Debug: retrieved chunks"):
+        for c in chunks:
+            st.markdown(f"**[{c['num']}] score {c['score']}**: {c['title']}")
+            st.text(c["text"][:600])
+            st.divider()
